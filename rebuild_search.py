@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """
-Rebuild a "dropped" network whose pieces are individual nn.Linear layers:
-- 48 Up layers: 48 -> 96   (weight shape [96,48])
-- 48 Down layers: 96 -> 48 (weight shape [48,96])
-- 1 Last layer:  48 -> 1   (weight shape [1,48])
+Permutation search for dropped residual network.
 
-Pipeline (with logging):
-Stage 1: Pair Up/Down into residual Blocks via assignment (Hungarian if SciPy available).
-Stage 2: Initial ordering via transition-cost surrogate (greedy + 2-opt).
+Pieces:
+- 48 Up:   48 -> 96  (weight [96,48])
+- 48 Down: 96 -> 48  (weight [48,96])
+- 1 Last:  48 -> 1   (weight [1,48])
+
+Pipeline per restart:
+Stage 1: Pair Up/Down into blocks (Hungarian if SciPy else greedy).
+Stage 2: Build diverse candidate orders (randomized greedy + 2opt), pick best by MSE on subsample.
 Stage 3: Alternating refinement:
-    - ORDER-SA on true MSE (permute block order)
-    - PAIR-SA on true MSE (swap Down partners between blocks, order fixed)
-    Repeat a few rounds.
+    - ORDER-SA: SA over block order (true MSE)
+    - PAIR-SA:  SA over pairing (swap/cycle/shuffle downs), order fixed (true MSE)
 
-Outputs best piece permutation (length 97): [up0,down0, up1,down1, ..., up47,down47, last]
+Global: run --restarts times, keep best full MSE.
 """
 
 import os, re, csv, time, math, random, argparse, logging
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import torch
 import torch.nn.functional as F
@@ -98,14 +99,7 @@ def load_data_csv(data_file: str, device: torch.device, target_col: str = "pred"
 # -----------------------------
 # Forward / Loss
 # -----------------------------
-def forward_from_piece_perm(
-    x: torch.Tensor,
-    pieces: Dict[int, Piece],
-    piece_perm: List[int],
-) -> torch.Tensor:
-    """
-    piece_perm: length 97 = [up0,down0, up1,down1, ..., up47,down47, last]
-    """
+def forward_from_piece_perm(x: torch.Tensor, pieces: Dict[int, Piece], piece_perm: List[int]) -> torch.Tensor:
     curr = x
     for k in range(0, len(piece_perm) - 1, 2):
         up_idx = piece_perm[k]
@@ -114,37 +108,39 @@ def forward_from_piece_perm(
         w_dn, b_dn = pieces[down_idx]["weight"], pieces[down_idx]["bias"]
 
         residual = curr
-        hidden = F.linear(curr, w_up, b_up)  # [B,96]
+        hidden = F.linear(curr, w_up, b_up)
         hidden = F.relu(hidden)
-        out = F.linear(hidden, w_dn, b_dn)   # [B,48]
+        out = F.linear(hidden, w_dn, b_dn)
         curr = residual + out
 
     last_idx = piece_perm[-1]
     w_last, b_last = pieces[last_idx]["weight"], pieces[last_idx]["bias"]
-    y_pred = F.linear(curr, w_last, b_last)  # [B,1]
-    return y_pred
+    return F.linear(curr, w_last, b_last)
 
 @torch.no_grad()
-def mse_for_perm(
-    pieces: Dict[int, Piece],
-    piece_perm: List[int],
-    x: torch.Tensor,
-    y: torch.Tensor,
-) -> float:
+def mse_for_perm(pieces: Dict[int, Piece], piece_perm: List[int], x: torch.Tensor, y: torch.Tensor) -> float:
     y_pred = forward_from_piece_perm(x, pieces, piece_perm)
     return float(torch.mean((y_pred - y) ** 2).item())
 
-def blocks_to_piece_perm(
-    block_order: List[int],
-    block_pairs: List[Tuple[int, int]],
-    last_idx: int
-) -> List[int]:
+def blocks_to_piece_perm(block_order: List[int], block_pairs: List[Tuple[int, int]], last_idx: int) -> List[int]:
     perm: List[int] = []
     for bi in block_order:
         u, d = block_pairs[bi]
         perm.extend([u, d])
     perm.append(last_idx)
     return perm
+
+@torch.no_grad()
+def mse_for_block_order(
+    pieces: Dict[int, Piece],
+    block_pairs: List[Tuple[int, int]],
+    block_order: List[int],
+    last_idx: int,
+    x: torch.Tensor,
+    y: torch.Tensor,
+) -> float:
+    piece_perm = blocks_to_piece_perm(block_order, block_pairs, last_idx)
+    return mse_for_perm(pieces, piece_perm, x, y)
 
 # -----------------------------
 # Stage 1: Pairing via Assignment
@@ -159,13 +155,6 @@ def pairing_cost_matrix(
     update_weight: float = 1.0,
     mean_weight: float = 0.05,
 ) -> torch.Tensor:
-    """
-    Cost matrix C[i,j] lower is better pairing (up_i with down_j).
-    Combines:
-      - update magnitude E||down(ReLU(up(x)))||^2
-      - activation rate penalty |P(pre>0)-0.5|
-      - mean output penalty (bias blowups)
-    """
     n_up = len(up_idxs)
     n_dn = len(down_idxs)
 
@@ -175,34 +164,47 @@ def pairing_cost_matrix(
     C = torch.empty((n_up, n_dn), device=x_batch.device, dtype=torch.float32)
 
     for i, ui in enumerate(up_idxs):
-        w_up, b_up = pieces[ui]["weight"], pieces[ui]["bias"]             # [96,48], [96]
-        pre = F.linear(x_batch, w_up, b_up)                               # [B,96]
+        w_up, b_up = pieces[ui]["weight"], pieces[ui]["bias"]
+        pre = F.linear(x_batch, w_up, b_up)                      # [B,96]
         act = (pre > 0).float().mean().item()
         act_pen = abs(act - 0.5)
 
-        h = F.relu(pre)                                                   # [B,96]
+        h = F.relu(pre)
         out_all = torch.einsum("bm,nkm->nbk", h, W_dn) + b_dn[:, None, :]  # [n_dn,B,48]
 
-        update_mse = out_all.pow(2).mean(dim=(1, 2))                       # [n_dn]
-        mean_pen   = out_all.mean(dim=(1, 2)).pow(2)                       # [n_dn]
+        update_mse = out_all.pow(2).mean(dim=(1, 2))
+        mean_pen   = out_all.mean(dim=(1, 2)).pow(2)
 
         C[i] = update_weight * update_mse + act_weight * act_pen + mean_weight * mean_pen
 
     return C
 
 def solve_assignment(cost: torch.Tensor) -> List[int]:
-    """
-    Returns match[i] = j for each row i.
-    Uses SciPy Hungarian if available; otherwise greedy fallback.
-    """
     cost_cpu = cost.detach().cpu().numpy()
-    from scipy.optimize import linear_sum_assignment
-    r, c = linear_sum_assignment(cost_cpu)
-    match = [-1] * cost_cpu.shape[0]
-    for ri, ci in zip(r, c):
-        match[int(ri)] = int(ci)
-    assert all(m >= 0 for m in match)
-    return match
+    try:
+        from scipy.optimize import linear_sum_assignment
+        r, c = linear_sum_assignment(cost_cpu)
+        logging.info("Pairing: Hungarian (scipy) linear_sum_assignment")
+        match = [-1] * cost_cpu.shape[0]
+        for ri, ci in zip(r, c):
+            match[int(ri)] = int(ci)
+        return match
+    except Exception as e:
+        logging.warning(f"Pairing: Hungarian unavailable/failed ({e}); using greedy fallback")
+        n = cost_cpu.shape[0]
+        used = set()
+        match = [-1] * n
+        for i in range(n):
+            best_j, best_v = None, float("inf")
+            for j in range(n):
+                if j in used:
+                    continue
+                v = float(cost_cpu[i, j])
+                if v < best_v:
+                    best_v, best_j = v, j
+            used.add(best_j)
+            match[i] = best_j
+        return match
 
 def stage1_pair_blocks(
     pieces: Dict[int, Piece],
@@ -213,11 +215,10 @@ def stage1_pair_blocks(
     logging.info("Stage 1: pairing Up/Down into Blocks (assignment)")
     C = pairing_cost_matrix(x_for_cost, pieces, up_idxs, down_idxs)
     match = solve_assignment(C)
-    block_pairs = [(up_idxs[i], down_idxs[j]) for i, j in enumerate(match)]
-    return block_pairs
+    return [(up_idxs[i], down_idxs[j]) for i, j in enumerate(match)]
 
 # -----------------------------
-# Stage 2: Ordering via Transition Costs (greedy + 2opt)
+# Stage 2: Ordering via Transition Costs (diverse candidates)
 # -----------------------------
 @torch.no_grad()
 def block_health_costs(
@@ -228,20 +229,15 @@ def block_health_costs(
     update_weight: float = 1.0,
     mean_weight: float = 0.05,
 ) -> torch.Tensor:
-    """
-    Vectorized 'health' cost for applying each block to x.
-    W_up: [B,96,48], b_up:[B,96], W_dn:[B,48,96], b_dn:[B,48]
-    Returns costs [B]
-    """
     pre = torch.einsum("nd,bod->bno", x, W_up) + b_up[:, None, :]         # [B,N,96]
-    act = (pre > 0).float().mean(dim=(1, 2))                               # [B]
+    act = (pre > 0).float().mean(dim=(1, 2))
     act_pen = (act - 0.5).abs()
 
-    h = F.relu(pre)                                                        # [B,N,96]
-    out = torch.einsum("bni,bki->bnk", h, W_dn) + b_dn[:, None, :]         # [B,N,48]
+    h = F.relu(pre)
+    out = torch.einsum("bni,bki->bnk", h, W_dn) + b_dn[:, None, :]
 
-    update_mse = out.pow(2).mean(dim=(1, 2))                                # [B]
-    mean_pen   = out.mean(dim=(1, 2)).pow(2)                                # [B]
+    update_mse = out.pow(2).mean(dim=(1, 2))
+    mean_pen   = out.mean(dim=(1, 2)).pow(2)
     return update_weight * update_mse + act_weight * act_pen + mean_weight * mean_pen
 
 @torch.no_grad()
@@ -261,19 +257,15 @@ def transition_cost_matrix(
     pieces: Dict[int, Piece],
     block_pairs: List[Tuple[int, int]],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    start_cost[j]: cost of using block j first on x_seed
-    w[i,j]: cost of using block j after applying block i to x_seed
-    """
     B = len(block_pairs)
     device = x_seed.device
 
-    W_up = torch.stack([pieces[u]["weight"] for (u, _) in block_pairs], dim=0)  # [B,96,48]
-    b_up = torch.stack([pieces[u]["bias"]   for (u, _) in block_pairs], dim=0)  # [B,96]
-    W_dn = torch.stack([pieces[d]["weight"] for (_, d) in block_pairs], dim=0)  # [B,48,96]
-    b_dn = torch.stack([pieces[d]["bias"]   for (_, d) in block_pairs], dim=0)  # [B,48]
+    W_up = torch.stack([pieces[u]["weight"] for (u, _) in block_pairs], dim=0)
+    b_up = torch.stack([pieces[u]["bias"]   for (u, _) in block_pairs], dim=0)
+    W_dn = torch.stack([pieces[d]["weight"] for (_, d) in block_pairs], dim=0)
+    b_dn = torch.stack([pieces[d]["bias"]   for (_, d) in block_pairs], dim=0)
 
-    start_cost = block_health_costs(x_seed, W_up, b_up, W_dn, b_dn)            # [B]
+    start_cost = block_health_costs(x_seed, W_up, b_up, W_dn, b_dn)
 
     w = torch.empty((B, B), device=device, dtype=torch.float32)
     for i in range(B):
@@ -287,28 +279,15 @@ def transition_cost_matrix(
 
     return start_cost, w
 
-def greedy_path(start_cost: torch.Tensor, w: torch.Tensor) -> List[int]:
-    B = int(start_cost.numel())
-    start = int(torch.argmin(start_cost).item())
-    order = [start]
-    unused = set(range(B))
-    unused.remove(start)
-    while unused:
-        prev = order[-1]
-        nxt = min(unused, key=lambda j: float(w[prev, j].item()))
-        order.append(nxt)
-        unused.remove(nxt)
-    return order
-
-def path_cost(order: List[int], start_cost: torch.Tensor, w: torch.Tensor) -> float:
-    c = float(start_cost[order[0]].item())
-    for i in range(len(order) - 1):
-        c += float(w[order[i], order[i + 1]].item())
-    return c
-
 def two_opt_improve(order: List[int], start_cost: torch.Tensor, w: torch.Tensor, max_passes: int = 2) -> List[int]:
+    def path_cost(ordr: List[int]) -> float:
+        c = float(start_cost[ordr[0]].item())
+        for i in range(len(ordr) - 1):
+            c += float(w[ordr[i], ordr[i + 1]].item())
+        return c
+
     best = order[:]
-    best_c = path_cost(best, start_cost, w)
+    best_c = path_cost(best)
     B = len(best)
 
     for _ in range(max_passes):
@@ -316,7 +295,7 @@ def two_opt_improve(order: List[int], start_cost: torch.Tensor, w: torch.Tensor,
         for i in range(1, B - 2):
             for j in range(i + 1, B - 1):
                 cand = best[:i] + list(reversed(best[i:j + 1])) + best[j + 1:]
-                c = path_cost(cand, start_cost, w)
+                c = path_cost(cand)
                 if c + 1e-12 < best_c:
                     best, best_c = cand, c
                     improved = True
@@ -324,66 +303,142 @@ def two_opt_improve(order: List[int], start_cost: torch.Tensor, w: torch.Tensor,
             break
     return best
 
-def stage2_order_blocks(
+def randomized_greedy_path(
+    start_cost: torch.Tensor,
+    w: torch.Tensor,
+    rng: random.Random,
+    topk_start: int = 6,
+    topk_next: int = 6,
+    tau: float = 0.2,
+) -> List[int]:
+    """
+    Diverse greedy builder:
+      - start sampled among topk_start lowest start_cost
+      - each step samples next among topk_next lowest transition costs from prev
+    tau controls softness (lower -> more greedy).
+    """
+    B = int(start_cost.numel())
+    # start choice
+    sc = [(float(start_cost[i].item()), i) for i in range(B)]
+    sc.sort()
+    start_pool = [i for _, i in sc[:max(1, min(topk_start, B))]]
+
+    # sample start uniformly (or could do softmax)
+    start = start_pool[rng.randrange(len(start_pool))]
+
+    order = [start]
+    unused = set(range(B))
+    unused.remove(start)
+
+    while unused:
+        prev = order[-1]
+        candidates = [(float(w[prev, j].item()), j) for j in unused]
+        candidates.sort()
+        pool = candidates[:max(1, min(topk_next, len(candidates)))]
+
+        # softmax sampling over pool using tau
+        vals = [v for v, _ in pool]
+        m = min(vals)
+        probs = [math.exp(-(v - m) / max(tau, 1e-6)) for v in vals]
+        s = sum(probs)
+        r = rng.random() * s
+        acc = 0.0
+        chosen = pool[-1][1]
+        for p, (_, j) in zip(probs, pool):
+            acc += p
+            if acc >= r:
+                chosen = j
+                break
+
+        order.append(chosen)
+        unused.remove(chosen)
+
+    return order
+
+def stage2_order_blocks_diverse(
     pieces: Dict[int, Piece],
     block_pairs: List[Tuple[int, int]],
     x_seed: torch.Tensor,
+    x_eval: torch.Tensor,
+    y_eval: torch.Tensor,
+    last_idx: int,
+    rng: random.Random,
+    candidates: int = 12,
 ) -> List[int]:
-    logging.info("Stage 2: initial ordering via transition costs (greedy + 2-opt)")
+    """
+    Build several diverse orders using randomized greedy, locally improve with 2-opt,
+    then pick the best by true MSE on (x_eval, y_eval).
+    """
+    logging.info(f"Stage 2: initial ordering (diverse candidates={candidates})")
     start_cost, w = transition_cost_matrix(x_seed, pieces, block_pairs)
-    order = greedy_path(start_cost, w)
-    order = two_opt_improve(order, start_cost, w, max_passes=2)
-    return order
+
+    best_order = None
+    best_mse = float("inf")
+
+    for c in range(candidates):
+        if c == 0:
+            # baseline deterministic-ish: tau small and topk=1 makes it greedy
+            ord0 = randomized_greedy_path(start_cost, w, rng, topk_start=1, topk_next=1, tau=0.01)
+        else:
+            ord0 = randomized_greedy_path(start_cost, w, rng, topk_start=6, topk_next=6, tau=0.2)
+
+        ord0 = two_opt_improve(ord0, start_cost, w, max_passes=2)
+        mse = mse_for_block_order(pieces, block_pairs, ord0, last_idx, x_eval, y_eval)
+
+        if mse < best_mse:
+            best_mse = mse
+            best_order = ord0
+
+    assert best_order is not None
+    logging.info(f"Stage 2: best candidate sub-MSE = {best_mse:.12f}")
+    return best_order
 
 # -----------------------------
-# Stage 3a: ORDER-SA on true MSE
+# Stage 3a: ORDER-SA (stronger move set)
 # -----------------------------
-def propose_move(order: List[int], rng: random.Random) -> List[int]:
+def propose_order_move(order: List[int], rng: random.Random) -> List[int]:
     B = len(order)
     cand = order[:]
-    move = rng.random()
-    if move < 0.40:
+    r = rng.random()
+
+    if r < 0.35:
+        # swap
         i, j = rng.randrange(B), rng.randrange(B)
         cand[i], cand[j] = cand[j], cand[i]
-    elif move < 0.70:
+    elif r < 0.65:
+        # reverse segment
         i, j = sorted([rng.randrange(B), rng.randrange(B)])
         if i != j:
             cand[i:j + 1] = reversed(cand[i:j + 1])
-    else:
+    elif r < 0.85:
+        # relocate one element
         i = rng.randrange(B)
         v = cand.pop(i)
         j = rng.randrange(B)
         cand.insert(j, v)
+    else:
+        # shuffle a short window (bigger jump)
+        win = rng.randrange(4, 10)  # 4..9
+        i = rng.randrange(0, max(1, B - win))
+        window = cand[i:i + win]
+        rng.shuffle(window)
+        cand[i:i + win] = window
+
     return cand
 
-@torch.no_grad()
-def mse_for_block_order(
-    pieces: Dict[int, Piece],
-    block_pairs: List[Tuple[int, int]],
-    block_order: List[int],
-    last_idx: int,
-    x: torch.Tensor,
-    y: torch.Tensor,
-) -> float:
-    piece_perm = blocks_to_piece_perm(block_order, block_pairs, last_idx)
-    return mse_for_perm(pieces, piece_perm, x, y)
-
-def stage3_refine_order_sa(
+def order_sa(
     pieces: Dict[int, Piece],
     block_pairs: List[Tuple[int, int]],
     last_idx: int,
     init_order: List[int],
     x_full: torch.Tensor, y_full: torch.Tensor,
     x_sub: torch.Tensor,  y_sub: torch.Tensor,
-    iters: int = 6000,
-    T0: float = 2e-2,
-    Tmin: float = 1e-5,
-    eval_full_every: int = 200,
-    seed: int = 0,
-) -> List[int]:
-    logging.info("  ORDER-SA: simulated annealing on block order (subsampled + periodic full eval)")
-    rng = random.Random(seed)
-
+    iters: int,
+    T0: float,
+    Tmin: float,
+    eval_full_every: int,
+    rng: random.Random,
+) -> Tuple[List[int], float]:
     def temperature(t: int) -> float:
         frac = t / max(1, iters - 1)
         return T0 * ((Tmin / T0) ** frac)
@@ -400,7 +455,7 @@ def stage3_refine_order_sa(
     last_log = now_ms()
     for t in range(1, iters + 1):
         T = temperature(t)
-        cand = propose_move(curr, rng)
+        cand = propose_order_move(curr, rng)
         cand_loss = mse_for_block_order(pieces, block_pairs, cand, last_idx, x_sub, y_sub)
 
         d = cand_loss - curr_loss
@@ -415,7 +470,7 @@ def stage3_refine_order_sa(
             if full < best_full - 1e-15:
                 best_full = full
 
-        if t % 200 == 0:
+        if t % 250 == 0:
             now = now_ms()
             dt = (now - last_log) / 1000.0
             last_log = now
@@ -427,79 +482,102 @@ def stage3_refine_order_sa(
                 logging.info("    Early stop: full MSE ~ 0.")
                 break
 
-    return best
+    return best, best_full
 
 # -----------------------------
-# Stage 3b: PAIR-SA (swap Down partners) on true MSE
+# Stage 3b: PAIR-SA (stronger pairing moves)
 # -----------------------------
-def sa_pairing_swaps(
-    pieces: Dict[int, Piece],
-    block_pairs: List[Tuple[int, int]],   # (up, down)
-    last_idx: int,
-    fixed_order: List[int],
-    x_full: torch.Tensor, y_full: torch.Tensor,
-    x_sub: torch.Tensor,  y_sub: torch.Tensor,
-    iters: int = 6000,
-    T0: float = 5e-3,
-    Tmin: float = 5e-6,
-    eval_full_every: int = 250,
-    seed: int = 0,
-) -> List[Tuple[int, int]]:
-    logging.info("  PAIR-SA: simulated annealing on pairing (swap Down partners), order fixed")
-    rng = random.Random(seed)
+def propose_pair_move(pairs: List[Tuple[int, int]], rng: random.Random) -> List[Tuple[int, int]]:
+    B = len(pairs)
+    cand = pairs[:]
+    r = rng.random()
 
-    def temperature(t: int) -> float:
-        frac = t / max(1, iters - 1)
-        return T0 * ((Tmin / T0) ** frac)
-
-    @torch.no_grad()
-    def loss_on_sub(pairs):
-        perm = blocks_to_piece_perm(fixed_order, pairs, last_idx)
-        return mse_for_perm(pieces, perm, x_sub, y_sub)
-
-    @torch.no_grad()
-    def loss_on_full(pairs):
-        perm = blocks_to_piece_perm(fixed_order, pairs, last_idx)
-        return mse_for_perm(pieces, perm, x_full, y_full)
-
-    curr = block_pairs[:]
-    curr_loss = loss_on_sub(curr)
-
-    best = curr[:]
-    best_sub = curr_loss
-    best_full = loss_on_full(best)
-
-    logging.info(f"    init: sub_mse={best_sub:.10f} full_mse={best_full:.10f}")
-
-    B = len(curr)
-    last_log = now_ms()
-    for t in range(1, iters + 1):
-        T = temperature(t)
+    if r < 0.55:
+        # swap downs between 2 blocks
         i, j = rng.randrange(B), rng.randrange(B)
         while j == i:
             j = rng.randrange(B)
-
-        cand = curr[:]
         ui, di = cand[i]
         uj, dj = cand[j]
         cand[i] = (ui, dj)
         cand[j] = (uj, di)
 
-        cand_loss = loss_on_sub(cand)
+    elif r < 0.80:
+        # 3-cycle of downs among 3 blocks
+        i, j, k = rng.sample(range(B), 3)
+        ui, di = cand[i]
+        uj, dj = cand[j]
+        uk, dk = cand[k]
+        cand[i] = (ui, dj)
+        cand[j] = (uj, dk)
+        cand[k] = (uk, di)
+
+    else:
+        # shuffle downs within a subset of blocks
+        ksz = rng.randrange(4, 8)  # 4..7
+        idxs = rng.sample(range(B), ksz)
+        downs = [cand[i][1] for i in idxs]
+        rng.shuffle(downs)
+        for ii, new_d in zip(idxs, downs):
+            cand[ii] = (cand[ii][0], new_d)
+
+    return cand
+
+def pair_sa(
+    pieces: Dict[int, Piece],
+    init_pairs: List[Tuple[int, int]],
+    fixed_order: List[int],
+    last_idx: int,
+    x_full: torch.Tensor, y_full: torch.Tensor,
+    x_sub: torch.Tensor,  y_sub: torch.Tensor,
+    iters: int,
+    T0: float,
+    Tmin: float,
+    eval_full_every: int,
+    rng: random.Random,
+) -> Tuple[List[Tuple[int, int]], float]:
+    def temperature(t: int) -> float:
+        frac = t / max(1, iters - 1)
+        return T0 * ((Tmin / T0) ** frac)
+
+    @torch.no_grad()
+    def loss_sub(pairs):
+        perm = blocks_to_piece_perm(fixed_order, pairs, last_idx)
+        return mse_for_perm(pieces, perm, x_sub, y_sub)
+
+    @torch.no_grad()
+    def loss_full(pairs):
+        perm = blocks_to_piece_perm(fixed_order, pairs, last_idx)
+        return mse_for_perm(pieces, perm, x_full, y_full)
+
+    curr = init_pairs[:]
+    curr_loss = loss_sub(curr)
+
+    best = curr[:]
+    best_sub = curr_loss
+    best_full = loss_full(best)
+
+    logging.info(f"    init: sub_mse={best_sub:.10f} full_mse={best_full:.10f}")
+
+    last_log = now_ms()
+    for t in range(1, iters + 1):
+        T = temperature(t)
+        cand = propose_pair_move(curr, rng)
+        cand_loss = loss_sub(cand)
+
         d = cand_loss - curr_loss
         accept = (d <= 0.0) or (rng.random() < math.exp(-d / max(T, 1e-12)))
-
         if accept:
             curr, curr_loss = cand, cand_loss
             if curr_loss < best_sub - 1e-15:
                 best, best_sub = curr[:], curr_loss
 
         if t % eval_full_every == 0:
-            full = loss_on_full(best)
+            full = loss_full(best)
             if full < best_full - 1e-15:
                 best_full = full
 
-        if t % 200 == 0:
+        if t % 250 == 0:
             now = now_ms()
             dt = (now - last_log) / 1000.0
             last_log = now
@@ -511,10 +589,36 @@ def sa_pairing_swaps(
                 logging.info("    Early stop: full MSE ~ 0.")
                 break
 
-    return best
+    return best, best_full
 
 # -----------------------------
-# Orchestration
+# Batching helpers (per restart)
+# -----------------------------
+def make_batches(
+    x_full: torch.Tensor,
+    y_full: torch.Tensor,
+    pair_batch: int,
+    order_batch: int,
+    sub_batch: int,
+    seed: int,
+    device: torch.device,
+):
+    n = x_full.shape[0]
+    gen = torch.Generator(device=device)
+    gen.manual_seed(seed)
+
+    rp = torch.randperm(n, generator=gen, device=device)
+    x_pair = x_full[rp[:min(pair_batch, n)]]
+    x_order = x_full[rp[:min(order_batch, n)]]
+
+    rp2 = torch.randperm(n, generator=gen, device=device)
+    x_sub = x_full[rp2[:min(sub_batch, n)]]
+    y_sub = y_full[rp2[:min(sub_batch, n)]]
+
+    return x_pair, x_order, x_sub, y_sub
+
+# -----------------------------
+# Main
 # -----------------------------
 def main():
     setup_logger()
@@ -523,29 +627,35 @@ def main():
     ap.add_argument("--data_file", type=str, default="historical_data.csv")
     ap.add_argument("--target_col", type=str, default="pred", choices=["pred", "true"])
     ap.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda", "mps"])
-    ap.add_argument("--seed", type=int, default=0)
+
+    ap.add_argument("--seed", type=int, default=0, help="Use -1 for random seed each run")
+    ap.add_argument("--restarts", type=int, default=1)
 
     ap.add_argument("--pair_batch", type=int, default=1024)
     ap.add_argument("--order_batch", type=int, default=1024)
-    ap.add_argument("--sub_batch", type=int, default=5000)     # bigger by default to reduce subsample noise
+    ap.add_argument("--sub_batch", type=int, default=5000)
 
-    ap.add_argument("--order_sa_iters", type=int, default=6000)
-    ap.add_argument("--order_sa_T0", type=float, default=2e-2)
+    ap.add_argument("--stage2_candidates", type=int, default=16)
+
+    ap.add_argument("--alt_rounds", type=int, default=6)
+
+    ap.add_argument("--order_sa_iters", type=int, default=8000)
+    ap.add_argument("--order_sa_T0", type=float, default=3e-2)
     ap.add_argument("--order_sa_Tmin", type=float, default=1e-5)
 
-    ap.add_argument("--pair_sa_iters", type=int, default=6000)
-    ap.add_argument("--pair_sa_T0", type=float, default=5e-3)
-    ap.add_argument("--pair_sa_Tmin", type=float, default=5e-6)
+    ap.add_argument("--pair_sa_iters", type=int, default=8000)
+    ap.add_argument("--pair_sa_T0", type=float, default=2e-2)
+    ap.add_argument("--pair_sa_Tmin", type=float, default=2e-5)
 
-    ap.add_argument("--eval_full_every", type=int, default=100)  # more frequent full eval
-    ap.add_argument("--alt_rounds", type=int, default=5)
+    ap.add_argument("--eval_full_every", type=int, default=100)
 
     args = ap.parse_args()
 
-    seed_all(args.seed)
-
     if args.device == "auto":
-        device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
+        device = torch.device(
+            "cuda" if torch.cuda.is_available()
+            else ("mps" if torch.backends.mps.is_available() else "cpu")
+        )
     else:
         device = torch.device(args.device)
 
@@ -557,89 +667,118 @@ def main():
     x_full, y_full = load_data_csv(args.data_file, device, target_col=args.target_col)
     logging.info(f"Loaded data: x={tuple(x_full.shape)} y={tuple(y_full.shape)} target_col={args.target_col}")
 
-    n = x_full.shape[0]
-    rp = torch.randperm(n, device=device)
-    x_pair  = x_full[rp[:min(args.pair_batch, n)]]
-    x_order = x_full[rp[:min(args.order_batch, n)]]
+    global_best_mse = float("inf")
+    global_best_perm: Optional[List[int]] = None
 
-    rp2 = torch.randperm(n, device=device)
-    x_sub = x_full[rp2[:min(args.sub_batch, n)]]
-    y_sub = y_full[rp2[:min(args.sub_batch, n)]]
+    base_seed = args.seed
+    if base_seed == -1:
+        base_seed = int(time.time()) ^ (os.getpid() << 8)
 
-    # ----------------- Stage 1 -----------------
-    t0 = time.time()
-    block_pairs = stage1_pair_blocks(pieces, up_idxs, down_idxs, x_pair)
-    init_order = list(range(len(block_pairs)))
-    init_perm = blocks_to_piece_perm(init_order, block_pairs, last_idx)
-    mse1 = mse_for_perm(pieces, init_perm, x_full, y_full)
-    logging.info(f"Stage 1 done in {time.time()-t0:.2f}s | full MSE (paired, naive order) = {mse1:.12f}")
+    for r in range(args.restarts):
+        run_seed = base_seed + 100003 * r
+        seed_all(run_seed)
+        rng = random.Random(run_seed + 424242)
 
-    # ----------------- Stage 2 -----------------
-    t0 = time.time()
-    order = stage2_order_blocks(pieces, block_pairs, x_order)
-    perm2 = blocks_to_piece_perm(order, block_pairs, last_idx)
-    mse2 = mse_for_perm(pieces, perm2, x_full, y_full)
-    logging.info(f"Stage 2 done in {time.time()-t0:.2f}s | full MSE (surrogate order) = {mse2:.12f}")
+        logging.info("=" * 72)
+        logging.info(f"RESTART {r+1}/{args.restarts} | seed={run_seed}")
 
-    # ----------------- Stage 3 (Alternating) -----------------
-    pairs = block_pairs
-    best_mse = mse2
-    best_perm = perm2
-
-    for r in range(1, args.alt_rounds + 1):
-        logging.info(f"Stage 3 Alt Round {r}/{args.alt_rounds}: ORDER-SA")
-        t_round = time.time()
-        order = stage3_refine_order_sa(
-            pieces=pieces,
-            block_pairs=pairs,
-            last_idx=last_idx,
-            init_order=order,
-            x_full=x_full, y_full=y_full,
-            x_sub=x_sub, y_sub=y_sub,
-            iters=args.order_sa_iters,
-            T0=args.order_sa_T0,
-            Tmin=args.order_sa_Tmin,
-            eval_full_every=args.eval_full_every,
-            seed=args.seed + 1000 * r,
+        x_pair, x_order, x_sub, y_sub = make_batches(
+            x_full, y_full,
+            args.pair_batch, args.order_batch, args.sub_batch,
+            seed=run_seed + 7,
+            device=device,
         )
-        perm_tmp = blocks_to_piece_perm(order, pairs, last_idx)
-        mse_tmp = mse_for_perm(pieces, perm_tmp, x_full, y_full)
-        logging.info(f"  After ORDER-SA: full MSE = {mse_tmp:.12f} (round time {time.time()-t_round:.2f}s)")
-        if mse_tmp < best_mse:
-            best_mse, best_perm = mse_tmp, perm_tmp
-            logging.info(f"  NEW BEST after ORDER-SA: full MSE = {best_mse:.12f}")
 
-        logging.info(f"Stage 3 Alt Round {r}/{args.alt_rounds}: PAIR-SA (swap down partners)")
-        t_round = time.time()
-        pairs = sa_pairing_swaps(
+        # Stage 1
+        t0 = time.time()
+        block_pairs = stage1_pair_blocks(pieces, up_idxs, down_idxs, x_pair)
+        naive_order = list(range(len(block_pairs)))
+        mse_stage1 = mse_for_block_order(pieces, block_pairs, naive_order, last_idx, x_full, y_full)
+        logging.info(f"Stage 1 done in {time.time()-t0:.2f}s | full MSE (naive order) = {mse_stage1:.12f}")
+
+        # Stage 2 (diverse)
+        t0 = time.time()
+        order = stage2_order_blocks_diverse(
             pieces=pieces,
-            block_pairs=pairs,
+            block_pairs=block_pairs,
+            x_seed=x_order,
+            x_eval=x_sub,
+            y_eval=y_sub,
             last_idx=last_idx,
-            fixed_order=order,
-            x_full=x_full, y_full=y_full,
-            x_sub=x_sub, y_sub=y_sub,
-            iters=args.pair_sa_iters,
-            T0=args.pair_sa_T0,
-            Tmin=args.pair_sa_Tmin,
-            eval_full_every=args.eval_full_every,
-            seed=args.seed + 1000 * r + 777,
+            rng=rng,
+            candidates=args.stage2_candidates,
         )
-        perm_tmp = blocks_to_piece_perm(order, pairs, last_idx)
-        mse_tmp = mse_for_perm(pieces, perm_tmp, x_full, y_full)
-        logging.info(f"  After PAIR-SA:  full MSE = {mse_tmp:.12f} (round time {time.time()-t_round:.2f}s)")
-        if mse_tmp < best_mse:
-            best_mse, best_perm = mse_tmp, perm_tmp
-            logging.info(f"  NEW BEST after PAIR-SA: full MSE = {best_mse:.12f}")
+        mse_stage2 = mse_for_block_order(pieces, block_pairs, order, last_idx, x_full, y_full)
+        logging.info(f"Stage 2 done in {time.time()-t0:.2f}s | full MSE = {mse_stage2:.12f}")
 
-        if best_mse <= 1e-15:
-            logging.info("Reached ~0 full MSE; stopping alternating refinement.")
+        best_mse = mse_stage2
+        best_perm = blocks_to_piece_perm(order, block_pairs, last_idx)
+        pairs = block_pairs
+
+        # Stage 3 (alternating)
+        for rr in range(1, args.alt_rounds + 1):
+            logging.info(f"Alt round {rr}/{args.alt_rounds}: ORDER-SA")
+            t0 = time.time()
+            order, full_after_order = order_sa(
+                pieces=pieces,
+                block_pairs=pairs,
+                last_idx=last_idx,
+                init_order=order,
+                x_full=x_full, y_full=y_full,
+                x_sub=x_sub,  y_sub=y_sub,
+                iters=args.order_sa_iters,
+                T0=args.order_sa_T0,
+                Tmin=args.order_sa_Tmin,
+                eval_full_every=args.eval_full_every,
+                rng=rng,
+            )
+            logging.info(f"  After ORDER-SA: full MSE = {full_after_order:.12f} (dt={time.time()-t0:.2f}s)")
+            if full_after_order < best_mse:
+                best_mse = full_after_order
+                best_perm = blocks_to_piece_perm(order, pairs, last_idx)
+                logging.info(f"  NEW BEST (restart-local) after ORDER-SA: {best_mse:.12f}")
+
+            logging.info(f"Alt round {rr}/{args.alt_rounds}: PAIR-SA (swap/cycle/shuffle downs)")
+            t0 = time.time()
+            pairs, full_after_pair = pair_sa(
+                pieces=pieces,
+                init_pairs=pairs,
+                fixed_order=order,
+                last_idx=last_idx,
+                x_full=x_full, y_full=y_full,
+                x_sub=x_sub,  y_sub=y_sub,
+                iters=args.pair_sa_iters,
+                T0=args.pair_sa_T0,
+                Tmin=args.pair_sa_Tmin,
+                eval_full_every=args.eval_full_every,
+                rng=rng,
+            )
+            logging.info(f"  After PAIR-SA:  full MSE = {full_after_pair:.12f} (dt={time.time()-t0:.2f}s)")
+            if full_after_pair < best_mse:
+                best_mse = full_after_pair
+                best_perm = blocks_to_piece_perm(order, pairs, last_idx)
+                logging.info(f"  NEW BEST (restart-local) after PAIR-SA: {best_mse:.12f}")
+
+            if best_mse <= 1e-15:
+                logging.info("Reached ~0 MSE; stopping early.")
+                break
+
+        logging.info(f"RESTART {r+1} best full MSE = {best_mse:.12f}")
+
+        if best_mse < global_best_mse:
+            global_best_mse = best_mse
+            global_best_perm = best_perm
+            logging.info(f"NEW GLOBAL BEST: full MSE = {global_best_mse:.12f}")
+            logging.info(f"NEW GLOBAL BEST PERMUTATION: {global_best_perm}")
+
+        if global_best_mse <= 1e-15:
             break
 
-    logging.info(f"Final best full MSE = {best_mse:.12f}")
-
-    print("\nBEST PIECE PERMUTATION (length={}):".format(len(best_perm)))
-    print(best_perm)
-    print("\nBest full MSE:", best_mse)
+    logging.info("=" * 72)
+    logging.info(f"FINAL GLOBAL BEST full MSE = {global_best_mse:.12f}")
+    print("\nBEST PIECE PERMUTATION (length={}):".format(len(global_best_perm)))
+    print(global_best_perm)
+    print("\nBest full MSE:", global_best_mse)
 
 if __name__ == "__main__":
     main()
